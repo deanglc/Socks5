@@ -1,12 +1,11 @@
+import asyncio
 import logging
-import selectors
-import socket
-import sys
 import threading
 import time
-import traceback
+from socket import AF_INET6, inet_aton, inet_ntoa, inet_ntop, inet_pton, error
 
-logger = logging.getLogger("Socks5")
+logger: logging.Logger = logging.getLogger("Socks5")
+_loop: asyncio.AbstractEventLoop = asyncio.get_event_loop()
 
 
 class Socks5Error(Exception):
@@ -17,9 +16,6 @@ class AuthenticationError(Socks5Error):
     pass
 
 
-# Empty byte
-EMPTY = b''
-# Response Type
 SUCCEEDED = 0
 GENERAL_SOCKS_SERVER_FAILURE = 1
 CONNECTION_NOT_ALLOWED_BY_RULESET = 2
@@ -31,151 +27,60 @@ COMMAND_NOT_SUPPORTED = 7
 ADDRESS_TYPE_NOT_SUPPORTED = 8
 
 
-def judge(ip: str) -> int:
-    try:
-        socket.inet_aton(ip)
-        return 4
-    except OSError:
-        pass
-    try:
-        socket.inet_pton(socket.AF_INET6, ip)
-        return 6
-    except OSError:
-        return 0
+class _Socket:
 
+    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        self.r = reader
+        self.w = writer
+        self.__socket = writer.get_extra_info('socket')
+        self.__address = writer.get_extra_info('peername')
 
-class BaseSessoin:
-    """
-    Client session
-    Subclass must set handler
-    """
+    @property
+    def address(self):
+        return self.__address
 
-    SessionSet = dict()
+    @property
+    def socket(self):
+        return self.__socket
 
-    def __init__(self, sock: socket.socket, address: tuple):
-        self.socket = sock
-        self.address = address
-        self.auth = BaseAuthentication(self)
-        self.SessionSet[self.socket] = {"address": self.address}
-
-    def __del__(self):
-        self.SessionSet.pop(self.socket)
-
-    def recv(self, num: int) -> bytes:
-        data = self.socket.recv(num)
-        logger.debug("<<< %s" % data)
-        if data == EMPTY:
-            raise ConnectionError("Recv a empty bytes that may FIN or RST")
+    async def recv(self, num: int) -> bytes:
+        data = await self.r.read(num)
         return data
 
-    def send(self, data: bytes) -> int:
-        self.socket.sendall(data)
-        logger.debug(">>> %s" % data)
+    async def send(self, data: bytes) -> int:
+        self.w.write(data)
+        await self.w.drain()
         return len(data)
 
-    def start(self):
-        try:
-            self.negotiate()
-        except Socks5Error as e:
-            logger.error(e)
-            self.socket.close()
-        except (ConnectionError, ConnectionAbortedError, ConnectionRefusedError, ConnectionResetError) as e:
-            logger.error(e)
+    async def sockrecv(self, num: int, loop: asyncio.AbstractEventLoop) -> bytes:
+        data = await loop.sock_recv(self.socket, num)
+        return data
 
-    def negotiate(self):
-        data = self.recv(2)
-        VER, NMETHODS = data
-        if VER != 5:
-            self.send(b"\x05\xff")
-            raise Socks5Error("Unsupported version!")
-        METHODS = set(self.recv(NMETHODS))
-        METHOD = self.auth.getMethod(METHODS)
-        reply = b'\x05' + METHOD.to_bytes(1, 'big')
-        self.send(reply)
-        if METHOD == 255:
-            raise Socks5Error("No methods available")
-        self.auth.authenticate()
-        del self.auth
-        data = self.recv(4)
-        VER, CMD, RSV, ATYP = data
-        if VER != 5:
-            self.reply(GENERAL_SOCKS_SERVER_FAILURE)
-            raise Socks5Error("Unsupported version!")
-        # Parse target address
-        if ATYP == 1:  # IPV4
-            ipv4 = self.recv(4)
-            DST_ADDR = socket.inet_ntoa(ipv4)
-        elif ATYP == 3:  # Domain
-            addr_len = int.from_bytes(self.recv(1), byteorder='big')
-            DST_ADDR = self.recv(addr_len).decode()
-        elif ATYP == 4:  # IPV6
-            ipv6 = self.recv(16)
-            DST_ADDR = socket.inet_ntop(socket.AF_INET6, ipv6)
-        else:
-            self.reply(ADDRESS_TYPE_NOT_SUPPORTED)
-            raise Socks5Error("Unsupported ATYP value: %s" % ATYP)
-        DST_PORT = int.from_bytes(self.recv(2), 'big')
-        logger.info("Client reuqest %s:%s" % (DST_ADDR, DST_PORT))
-        if CMD == 1:
-            self.SessionSet[self.socket].update({"method": "connect"})
-            self.socks5_connect(ATYP, DST_ADDR, DST_PORT)
-        elif CMD == 2:
-            self.SessionSet[self.socket].update({"method": "bind"})
-            self.socks5_bind(ATYP, DST_ADDR, DST_PORT)
-        elif CMD == 3:
-            self.SessionSet[self.socket].update({"method": "udp_associate"})
-            self.socks5_udp_associate(ATYP, DST_ADDR, DST_PORT)
-        else:
-            self.reply(COMMAND_NOT_SUPPORTED)
-            raise Socks5Error("Unsupported CMD value: %s" % CMD)
+    async def socksend(self, data: bytes, loop: asyncio.AbstractEventLoop) -> int:
+        await loop.sock_sendall(self.socket, data)
+        return len(data)
 
-    def reply(self, REP: int, ATYP: int = 1, IP: str = "127.0.0.1", port: int = 1080):
-        VER, RSV = b'\x05', b'\x00'
-        if ATYP == 1:
-            BND_ADDR = socket.inet_aton(IP)
-        elif ATYP == 4:
-            BND_ADDR = socket.inet_pton(socket.AF_INET6, IP)
-        elif ATYP == 3:
-            BND_ADDR = len(IP).to_bytes(2, 'big') + IP.encode("UTF-8")
-        else:
-            raise Socks5Error("Unsupported ATYP value: %s" % ATYP)
-        REP = REP.to_bytes(1, 'big')
-        ATYP = ATYP.to_bytes(1, 'big')
-        BND_PORT = int(port).to_bytes(2, 'big')
-        reply = VER + REP + RSV + ATYP + BND_ADDR + BND_PORT
-        self.send(reply)
-
-    def socks5_connect(self, ATYP: int, address: str, port: int):
-        """ must be overwrited """
-        self.reply(GENERAL_SOCKS_SERVER_FAILURE)
-        self.socket.close()
-
-    def socks5_bind(self, ATYP: int, address: str, port: int):
-        """ must be overwrited """
-        self.reply(GENERAL_SOCKS_SERVER_FAILURE)
-        self.socket.close()
-
-    def socks5_udp_associate(self, ATYP: int, address: str, port: int):
-        """ must be overwrited """
-        self.reply(GENERAL_SOCKS_SERVER_FAILURE)
-        self.socket.close()
+    def close(self):
+        self.w.close()
 
 
 class BaseAuthentication:
 
-    def __init__(self, session):
-        self.session = session
+    def __init__(self, socket: _Socket):
+        self.socket = socket
 
     def getMethod(self, methods: set) -> int:
         """
         Return a allowed authentication method or 255
+
         Must be overwrited.
         """
         return 255
 
-    def authenticate(self):
+    async def authenticate(self):
         """
         Authenticate user
+
         Must be overwrited.
         """
         raise AuthenticationError()
@@ -189,7 +94,7 @@ class NoAuthentication(BaseAuthentication):
             return 0
         return 255
 
-    def authenticate(self):
+    async def authenticate(self):
         pass
 
 
@@ -204,196 +109,198 @@ class PasswordAuthentication(BaseAuthentication):
             return 2
         return 255
 
-    def authenticate(self):
-        VER = self.session.recv(1)
+    async def authenticate(self):
+        VER = await self.socket.recv(1)
         if VER != 5:
-            self.session.send(b"\x05\x01")
+            await self.socket.send(b"\x05\x01")
             raise Socks5Error("Unsupported version!")
-        ULEN = int.from_bytes(self.session.recv(1), 'big')
-        UNAME = self.session.recv(ULEN).decode("ASCII")
-        PLEN = int.from_bytes(self.session.recv(1), 'big')
-        PASSWD = self.session.recv(PLEN).decode("ASCII")
+        ULEN = int.from_bytes(await self.socket.recv(1), 'big')
+        UNAME = await self.socket.recv(ULEN).decode("ASCII")
+        PLEN = int.from_bytes(await self.socket.recv(1), 'big')
+        PASSWD = await self.socket.recv(PLEN).decode("ASCII")
         if self._getUser().get(UNAME) and self._getUser().get(UNAME) == PASSWD:
-            self.session.send(b"\x05\x00")
+            await self.socket.send(b"\x05\x00")
         else:
-            self.session.send(b"\x05\x01")
+            await self.socket.send(b"\x05\x01")
             raise AuthenticationError("USERNAME or PASSWORD ERROR")
+
+
+class BaseSessoin:
+    """
+    Client session
+    """
+
+    def __init__(self, socket: _Socket):
+        self.socket = socket
+        self.auth = BaseAuthentication(self.socket)
+
+    async def recv(self, num: int) -> bytes:
+        data = await self.socket.recv(num)
+        logger.debug(f"<<< {data}")
+        if not data:
+            raise ConnectionError("Recv a empty bytes that may FIN or RST")
+        return data
+
+    async def send(self, data: bytes) -> int:
+        length = await self.socket.send(data)
+        logger.debug(f">>> {data}")
+        return length
+
+    async def start(self):
+        try:
+            await self.negotiate()
+        # 协商过程中出现Socks5不允许的情况
+        except Socks5Error as e:
+            logger.warning(e)
+            self.socket.close()
+        # 协商过程中发生网络错误
+        except (ConnectionError, ConnectionAbortedError, ConnectionRefusedError, ConnectionResetError) as e:
+            logger.error(e)
+            self.socket.close()
+
+    async def negotiate(self):
+        data = await self.recv(2)
+        VER, NMETHODS = data
+        if VER != 5:
+            await self.send(b"\x05\xff")
+            raise Socks5Error("Unsupported version!")
+        METHODS = set(await self.recv(NMETHODS))
+        METHOD = self.auth.getMethod(METHODS)
+        reply = b'\x05' + METHOD.to_bytes(1, 'big')
+        await self.send(reply)
+        if METHOD == 255:
+            raise Socks5Error("No methods available")
+        await self.auth.authenticate()
+        data = await self.recv(4)
+        VER, CMD, RSV, ATYP = data
+        if VER != 5:
+            await self.reply(GENERAL_SOCKS_SERVER_FAILURE)
+            raise Socks5Error("Unsupported version!")
+        # Parse target address
+        if ATYP == 1:  # IPV4
+            ipv4 = await self.recv(4)
+            DST_ADDR = inet_ntoa(ipv4)
+        elif ATYP == 3:  # Domain
+            addr_len = int.from_bytes(await self.recv(1), byteorder='big')
+            DST_ADDR = (await self.recv(addr_len)).decode()
+        elif ATYP == 4:  # IPV6
+            ipv6 = await self.recv(16)
+            DST_ADDR = inet_ntop(AF_INET6, ipv6)
+        else:
+            await self.reply(ADDRESS_TYPE_NOT_SUPPORTED)
+            raise Socks5Error(f"Unsupported ATYP value: {ATYP}")
+        DST_PORT = int.from_bytes(await self.recv(2), 'big')
+        if CMD == 1:
+            await self.socks5_connect(ATYP, DST_ADDR, DST_PORT)
+        elif CMD == 2:
+            await self.socks5_bind(ATYP, DST_ADDR, DST_PORT)
+        elif CMD == 3:
+            await self.socks5_udp_associate(ATYP, DST_ADDR, DST_PORT)
+        else:
+            await self.reply(COMMAND_NOT_SUPPORTED)
+            raise Socks5Error(f"Unsupported CMD value: {CMD}")
+
+    async def reply(self, REP: int, ATYP: int = 1, IP: str = "127.0.0.1", port: int = 1080):
+        VER, RSV = b'\x05', b'\x00'
+        if ATYP == 1:
+            BND_ADDR = inet_aton(IP)
+        elif ATYP == 4:
+            BND_ADDR = inet_pton(AF_INET6, IP)
+            ATYP = 4
+        elif ATYP == 3:
+            BND_ADDR = IP.encode("UTF-8")
+        else:
+            raise Socks5Error(f"Reply: unsupported ATYP value {ATYP}")
+        REP = REP.to_bytes(1, 'big')
+        ATYP = ATYP.to_bytes(1, 'big')
+        BND_PORT = int(port).to_bytes(2, 'big')
+        reply = VER + REP + RSV + ATYP + BND_ADDR + BND_PORT
+        await self.send(reply)
+
+    async def socks5_connect(self, ATYP: int, addr: str, port: int):
+        """ must be overwrited """
+        await self.reply(GENERAL_SOCKS_SERVER_FAILURE, ATYP, addr, port)
+        self.socket.close()
+
+    async def socks5_bind(self, ATYP: int, addr: str, port: int):
+        """ must be overwrited """
+        await self.reply(GENERAL_SOCKS_SERVER_FAILURE, ATYP, addr, port)
+        self.socket.close()
+
+    async def socks5_udp_associate(self, ATYP: int, addr: str, port: int):
+        """ must be overwrited """
+        await self.reply(GENERAL_SOCKS_SERVER_FAILURE, ATYP, addr, port)
+        self.socket.close()
 
 
 class DefaultSession(BaseSessoin):
     """ NO AUTHENTICATION REQUIRED Session"""
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.auth = NoAuthentication(self)
-        self.sel = selectors.DefaultSelector()
+    def __init__(self, socket: _Socket):
+        super().__init__(socket)
+        self.auth = NoAuthentication(self.socket)
 
-    def _forward(self, sender: socket.socket, receiver: socket.socket):
-        data = sender.recv(4096)
-        if data == EMPTY:
-            self._disconnect(sender, receiver)
-            raise ConnectionAbortedError("The client or destination has interrupted the connection.")
-        receiver.sendall(data)
-        logger.debug(f">=< {data}")
+    def _forward(self, sender: _Socket, receiver: _Socket):
+        async def inner(sender: _Socket, receiver: _Socket):
+            data = await sender.sockrecv(4096, _loop)
+            if not data:
+                self._disconnect(sender, receiver)
+                return
+            await receiver.send(data)
+            logger.debug(f">=< {data}")
+        asyncio.run_coroutine_threadsafe(inner(sender, receiver), _loop)
 
-    def _connect(self, local: socket.socket, remote: socket.socket):
-        self.sel.register(local, selectors.EVENT_READ, self._forward)
-        self.sel.register(remote, selectors.EVENT_READ, self._forward)
-        while True:
-            events = self.sel.select(timeout=5)
-            for key, mask in events:
-                callback = key.data
-                if key.fileobj == local:
-                    callback(key.fileobj, remote)
-                elif key.fileobj == remote:
-                    callback(key.fileobj, local)
+    def _connect(self, local: _Socket, remote: _Socket):
+        _loop.add_reader(remote.socket, self._forward, remote, local)
+        _loop.add_reader(local.socket, self._forward, local, remote)
 
-    def _disconnect(self, local: socket.socket, remote: socket.socket):
-        self.sel.unregister(local)
-        self.sel.unregister(remote)
+    def _disconnect(self, local: _Socket, remote: _Socket):
+        _loop.remove_reader(local.socket)
+        _loop.remove_reader(remote.socket)
         local.close()
         remote.close()
 
-    def socks5_connect(self, ATYP: int, address: str, port: int):
+    async def socks5_connect(self, ATYP: int, addr: str, port: int):
         try:
-            remote = socket.create_connection((address, port), timeout=5)
-            self.reply(SUCCEEDED)
-        except socket.timeout:
-            self.reply(CONNECTION_REFUSED)
-            logger.warning("Connection refused from %s:%s" % (address, port))
+            logger.info(f"Connect {addr}:{port}")
+            r, w = await asyncio.open_connection(addr, port, loop=_loop)
+            logger.info(f"Successfully connect {addr}:{port}")
+            await self.reply(SUCCEEDED)
+        except (TimeoutError, ConnectionError, ConnectionAbortedError, ConnectionRefusedError, ConnectionResetError, error):
+            await self.reply(CONNECTION_REFUSED)
+            logger.info(f"Failing connect {addr}:{port}")
+            self.socket.close()
             return
-        try:
-            self._connect(self.socket, remote)
-        except (ConnectionError, ConnectionAbortedError, ConnectionRefusedError, ConnectionResetError):
-            return
-
-    def _heartbeat(self):
-        try:
-            self.alive = True
-            while True:
-                self.send(b"heartbeat")
-                time.sleep(5)
-        except (ConnectionError, ConnectionAbortedError, ConnectionRefusedError, ConnectionResetError):
-            self.alive = False
-
-    def parse_udp_header(self, data: bytes) -> ((str, int), bytes):
-        _data = bytearray(data)
-
-        def get(num: int) -> bytes:
-            if num == -1:
-                return bytes(_data)
-            r = _data[:num]
-            del _data[:num]
-            return bytes(r)
-        RSV = get(2)
-        FRAG = get(1)
-        if int.from_bytes(FRAG, 'big') != 0:
-            return None
-        ATYP = int.from_bytes(get(1), 'big')
-        # Parse target address
-        if ATYP == 1:  # IPV4
-            ipv4 = get(4)
-            DST_ADDR = socket.inet_ntoa(ipv4)
-        elif ATYP == 3:  # Domain
-            addr_len = int.from_bytes(get(1), 'big')
-            DST_ADDR = get(addr_len).decode()
-        elif ATYP == 4:  # IPV6
-            ipv6 = get(16)
-            DST_ADDR = socket.inet_ntop(socket.AF_INET6, ipv6)
-        else:
-            return None
-        DST_PORT = int.from_bytes(get(2), 'big')
-        return ((DST_ADDR, DST_PORT), get(-1))
-
-    def add_udp_header(self, data: bytes, address: (str, int)) -> bytes:
-        RSV, FRAG = b'\x00\x00', b'\x00'
-        t = judge(address[0])
-        if t == 4:
-            ATYP = 1
-            DST_ADDR = socket.inet_aton(address[0])
-        elif t == 6:
-            ATYP = 4
-            DST_ADDR = socket.inet_pton(socket.AF_INET6, address[0])
-        else:
-            DST_ADDR = int(address[0]).to_bytes(2, 'big') + address[0].encode("UTF-8")
-            ATYP = 3
-        ATYP = ATYP.to_bytes(1, 'big')
-        DST_PORT = address[1].to_bytes(2, 'big')
-        reply = RSV + FRAG + ATYP + DST_ADDR + DST_PORT + data
-        return reply
-
-    def socks5_udp_associate(self, ATYP: int, address: str, port: int):
-        udp_server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        udp_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        udp_server.bind(('0.0.0.0', self.socket.getsockname()[1]))
-        self.reply(SUCCEEDED, IP=self.socket.getsockname()[0], port=self.socket.getsockname()[1])
-        config = self.SessionSet[self.socket]
-        config["source"] = (address, port)
-        threading.Thread(target=self._heartbeat, daemon=True).start()
-        while self.alive:
-            try:
-                msg, addr = udp_server.recvfrom(8192)
-                logger.debug(">>> %s" % msg)
-                if config["source"][0] == "0.0.0.0":
-                    config["source"] = addr
-
-                if config["source"] == addr:
-                    temp = self.parse_udp_header(msg)
-                    if temp is None:
-                        continue
-                    if config.get("target") is None:
-                        config["target"] = set((temp[0],))
-                    else:
-                        config["target"].add(temp[0])
-                    udp_server.sendto(temp[1], temp[0])
-                elif addr in config["target"]:
-                    udp_server.sendto(self.add_udp_header(msg, addr), config["source"])
-                else:  # Nothing to do.
-                    continue
-            except (ConnectionError, ConnectionAbortedError, ConnectionRefusedError, ConnectionResetError):
-                continue
+        remote = _Socket(r, w)
+        self._connect(self.socket, remote)
 
 
 class Socks5:
-    """
-    A socks5 server
-    """
+    """A socks5 server"""
 
-    def __init__(self, ip: str = "0.0.0.0", port: int = 1080, session: BaseSessoin = DefaultSession):
+    def __init__(self, IP: str = "0.0.0.0", port: int = 1080, session: BaseSessoin = DefaultSession):
+        self.IP = IP
+        self.port = port
         self.session = session
-        self.server = socket.socket(socket.AF_INET)
-        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server.bind((ip, port))
-        self.server.listen(13)
-        logger.info("Socks5 Server running on %s:%s" % (ip, port))
+        self.server = _loop.run_until_complete(
+            asyncio.start_server(
+                self._link, self.IP, self.port, loop=_loop
+            )
+        )
+        logger.info(f"Socks5 Server serveing on {self.server.sockets[0].getsockname()}")
 
     def __del__(self):
         self.server.close()
-        logger.info("Socks5 Server closed")
+        logger.info(f"Socks5 Server has closed.")
 
-    def _link(self, sock: socket.socket, address: (str, int)):
-        logger.info("Connection from %s:%s" % address)
-        session = self.session(sock, address)
-        session.start()
-        del session
-
-    def master_worker(self):
-        while True:
-            try:
-                sock, address = self.server.accept()
-                client = threading.Thread(
-                    target=self._link,
-                    args=(sock, address),
-                    daemon=True
-                )
-                client.start()
-            except socket.error:
-                logger.error("A error in connection from %s:%s" % address)
-                traceback.print_exc()
+    async def _link(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        socket = _Socket(reader, writer)
+        session = self.session(socket)
+        logger.debug(f"Connection from {socket.address}")
+        await session.start()
 
     def run(self):
-        worker = threading.Thread(target=self.master_worker, daemon=True)
-        worker.start()
+        threading.Thread(target=_loop.run_forever, daemon=True).start()
         try:
             while True:
                 time.sleep(1)
@@ -404,7 +311,7 @@ class Socks5:
 if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
-        format='[%(asctime)s] [%(levelname) -8s] %(message)s',
+        format='[%(levelname)s]-[%(asctime)s] %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S',
     )
     logger.setLevel(logging.DEBUG)
